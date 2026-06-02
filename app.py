@@ -1,191 +1,217 @@
 import os
-import tarfile
-import io
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash
-from flask_sqlalchemy import SQLAlchemy
-import docker
+import sys
+import psutil
+import schedule
+import requests
+import time
+import subprocess
+from threading import Thread
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash, jsonify
+from flask_socketio import SocketIO, emit
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
-app.secret_key = 'PLATINUM_HOSTING_SUPER_SECRET_KEY_2026'
+app.secret_key = 'TITAN_PREMIUM_HOSTING_2026'
 
-# إعداد قاعدة البيانات
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///advanced_hosting.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
+# إعداد SocketIO مع دعم eventlet/gevent للبث الفوري
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# الاتصال بـ Docker
-try:
-    client = docker.from_env()
-except Exception as e:
-    print("⚠️ تنبيه: تأكد من تشغيل Docker daemon على النظام!")
+# مجلد وهمي داخل السيرفر لتخزين ملفات المستخدمين بشكل معزول نسبياً
+BASE_USER_DIR = os.path.join(os.getcwd(), 'users_storage')
+if not os.path.exists(BASE_USER_DIR):
+    os.makedirs(BASE_USER_DIR)
 
-# ----------------- نموذج قاعدة البيانات -----------------
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password = db.Column(db.String(120), nullable=False)
-    is_admin = db.Column(db.Boolean, default=False)
-    container_id = db.Column(db.String(120), nullable=True)
-    main_file = db.Column(db.String(80), default="main.py")  # اسم ملف التشغيل الافتراضي
+# قاعدة بيانات مؤقتة في الذاكرة (Memory DB) لتسهيل الرفع الفوري على Railway دون تعقيد إعدادات SQL
+USERS = {
+    'admin': {'password': 'adminpassword', 'is_admin': True, 'main_file': 'main.py', 'pid': None}
+}
 
-with app.app_context():
-    db.create_all()
-    if not User.query.filter_by(username='admin').first():
-        admin_user = User(username='admin', password='adminpassword', is_admin=True)
-        db.add(admin_user)
-        db.commit()
+# ----------------- وظائف المراقبة والجدولة (psutil & schedule) -----------------
+def monitor_system():
+    """مراقبة استهلاك السيرفر وبثها فورياً عبر الـ WebSockets"""
+    cpu = psutil.cpu_percentage(interval=1)
+    ram = psutil.virtual_memory().percent
+    # بث البيانات لجميع المتصلين باللوحة
+    socketio.emit('sys_stats', {'cpu': cpu, 'ram': ram})
 
-# ----------------- واجهات الـ HTML الاحترافية (CSS مدمج) -----------------
+def run_schedule():
+    """تشغيل الجدولة في الخلفية للتحقق من استهلاك النظام كل 5 ثوانٍ"""
+    schedule.every(5).seconds.do(monitor_system)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
-BASE_LAYOUT = """
+# تشغيل خيط (Thread) الجدولة والمراقبة فور تشغيل السيرفر
+Thread(target=run_schedule, daemon=True).start()
+
+# ----------------- واجهات الـ HTML الاحترافية المتجاوبة -----------------
+LAYOUT = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
-    <title>منصة استضافة بايثون المتطورة</title>
+    <title>منصة استضافة التيرمنال المطور</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socketio/4.0.1/socketio.js"></script>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121420; color: #cfd8dc; margin: 0; padding: 0; }
-        .navbar { background: #1b1e2e; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #25293c; }
-        .navbar h2 { margin: 0; color: #00adb5; font-size: 20px; }
-        .navbar a { color: #ff5252; text-decoration: none; margin-right: 15px; font-weight: bold; }
+        body { font-family: Arial, sans-serif; background: #0f111a; color: #a6accd; margin: 0; padding: 0; }
+        .navbar { background: #1a1c29; padding: 15px 30px; display: flex; justify-content: space-between; border-bottom: 2px solid #232635; }
+        .navbar a { color: #ff5370; text-decoration: none; margin-right: 15px; font-weight: bold; }
         .container { max-width: 1200px; margin: 30px auto; padding: 0 20px; }
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 25px; }
-        .card { background: #1b1e2e; padding: 25px; border-radius: 10px; border: 1px solid #25293c; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
-        .card h3 { margin-top: 0; color: #fff; border-bottom: 1px solid #25293c; padding-bottom: 10px; }
-        input[type="text"], input[type="password"], textarea, select { width: 100%; padding: 10px; margin: 10px 0; background: #25293c; border: 1px solid #383f58; color: #fff; border-radius: 5px; box-sizing: border-box; }
-        .btn { padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-weight: bold; color: #fff; text-decoration: none; display: inline-block; }
-        .btn-blue { background: #007bff; } .btn-blue:hover { background: #0056b3; }
-        .btn-green { background: #28a745; } .btn-green:hover { background: #218838; }
-        .btn-red { background: #dc3545; } .btn-red:hover { background: #c82333; }
-        .terminal { background: #000; color: #00ff00; padding: 15px; font-family: monospace; border-radius: 5px; height: 180px; overflow-y: auto; white-space: pre-wrap; box-shadow: inset 0 0 10px #000; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 12px; text-align: right; border-bottom: 1px solid #25293c; }
-        th { color: #00adb5; }
-        .flash-msg { background: #ff5252; color: white; padding: 10px; border-radius: 5px; margin-bottom: 15px; text-align: center; }
+        .card { background: #1a1c29; padding: 25px; border-radius: 8px; border: 1px solid #232635; }
+        .card h3 { margin-top: 0; color: #fff; border-bottom: 1px solid #232635; padding-bottom: 10px; }
+        input[type="text"], input[type="password"], select { width: 100%; padding: 10px; margin: 10px 0; background: #232635; border: 1px solid #3b3f5c; color: #fff; border-radius: 4px; box-sizing: border-box; }
+        .btn { padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; color: #fff; text-decoration: none; display: inline-block; }
+        .btn-blue { background: #007bff; } .btn-green { background: #2cb57e; } .btn-red { background: #ff5370; }
+        .terminal { background: #000; color: #69f0ae; padding: 15px; font-family: monospace; border-radius: 4px; height: 200px; overflow-y: auto; white-space: pre-wrap; margin-top: 15px; }
+        .stat-box { display: flex; gap: 15px; margin-bottom: 20px; }
+        .stat-item { background: #232635; padding: 10px 20px; border-radius: 4px; flex: 1; text-align: center; font-weight: bold; color: #fff; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px; text-align: right; border-bottom: 1px solid #232635; }
+        .flash { background: #ff5370; color: white; padding: 10px; border-radius: 4px; margin-bottom: 15px; text-align: center; }
     </style>
 </head>
 <body>
     <div class="navbar">
-        <h2>🚀 PlatinumPy PaaS v2026</h2>
+        <h2 style="margin:0; color:#80cbc4;">🚀 VibeHost Engine v2</h2>
         <div>
             {% if session.get('username') %}
-                <span style="color: #fff">مرحباً، <b>{{ session['username'] }}</b></span> | 
-                {% if session.get('is_admin') %}<a href="/admin" style="color: #00adb5;">لوحة الإدارة</a> |{% endif %}
+                <span style="color:#fff">المستضيف: <b>{{ session['username'] }}</b></span> | 
+                {% if session.get('is_admin') %}<a href="/admin" style="color:#80cbc4;">لوحة الأدمن</a> |{% endif %}
                 <a href="/logout">تسجيل الخروج</a>
             {% endif %}
         </div>
     </div>
     <div class="container">
         {% with messages = get_flashed_messages() %}
-          {% if messages %}<div class="flash-msg">{{ messages[0] }}</div>{% endif %}
+          {% if messages %}<div class="flash">{{ messages[0] }}</div>{% endif %}
         {% endwith %}
         {% block content %}{% endblock %}
     </div>
+
+    <script>
+        // الاتصال بالبث الفوري الفعلي للمنصة
+        var socket = io();
+        socket.on('sys_stats', function(data) {
+            if(document.getElementById('cpu_val')) {
+                document.getElementById('cpu_val').innerText = data.cpu + '%';
+                document.getElementById('ram_val').innerText = data.ram + '%';
+            }
+        });
+        
+        // استقبال مخرجات التيرمنال لايف من السيرفر الخلفي
+        socket.on('terminal_stream', function(data) {
+            var term = document.getElementById('live_terminal');
+            if(term) {
+                term.innerText += data.text;
+                term.scrollTop = term.scrollHeight;
+            }
+        });
+    </script>
 </body>
 </html>
 """
 
 LOGIN_HTML = """
-{% extends "base_layout" %}
+{% extends "layout" %}
 {% block content %}
-<div style="max-width: 400px; margin: 100px auto;" class="card">
-    <h3>🔐 تسجيل الدخول للمنصة</h3>
+<div style="max-width: 400px; margin: 80px auto;" class="card">
+    <h3>🔐 تسجيل الدخول إلى السيرفر</h3>
     <form method="POST">
         <input type="text" name="username" placeholder="اسم المستخدم" required>
         <input type="password" name="password" placeholder="كلمة المرور" required>
-        <button type="submit" class="btn btn-blue" style="width: 100%;">دخول</button>
+        <button type="submit" class="btn btn-blue" style="width: 100%;">دخول الآمن</button>
     </form>
-    <p style="text-align: center; margin-top: 15px; font-size: 14px;">ليس لديك حساب؟ <a href="/register" style="color: #00adb5;">سجل من هنا</a></p>
+    <p style="text-align: center; margin-top:15px;">ليس لديك مساحة؟ <a href="/register" style="color:#80cbc4;">أنشئ حسابك الآن</a></p>
 </div>
 {% endblock %}
 """
 
 REGISTER_HTML = """
-{% extends "base_layout" %}
+{% extends "layout" %}
 {% block content %}
-<div style="max-width: 400px; margin: 100px auto;" class="card">
-    <h3>🚀 إنشاء حساب مستخدم جديد</h3>
+<div style="max-width: 400px; margin: 80px auto;" class="card">
+    <h3>🚀 حجز استضافة وبيئة بايثون جديدة</h3>
     <form method="POST">
-        <input type="text" name="username" placeholder="اسم المستخدم الجديد" required>
-        <input type="password" name="password" placeholder="كلمة المرور" required>
-        <button type="submit" class="btn btn-green" style="width: 100%;">أنشئ الحساب وافتح استضافتك</button>
+        <input type="text" name="username" placeholder="اختر اسم مستخدم" required>
+        <input type="password" name="password" placeholder="اختر كلمة مرور قوية" required>
+        <button type="submit" class="btn btn-green" style="width: 100%;">تفعيل الاستضافة الفورية</button>
     </form>
-    <p style="text-align: center; margin-top: 15px; font-size: 14px;">لديك حساب؟ <a href="/login" style="color: #00adb5;">سجل دخولك</a></p>
+    <p style="text-align: center; margin-top:15px;"><a href="/login" style="color:#80cbc4;">تسجيل الدخول للمشتركين</a></p>
 </div>
 {% endblock %}
 """
 
 DASHBOARD_HTML = """
-{% extends "base_layout" %}
+{% extends "layout" %}
 {% block content %}
+<div class="stat-box">
+    <div class="stat-item">المعالج الذكي (CPU): <span id="cpu_val" style="color:#69f0ae;">--</span></div>
+    <div class="stat-item">الذاكرة العشوائية (RAM): <span id="ram_val" style="color:#69f0ae;">--</span></div>
+    <div class="stat-item">حالة العملية الخلفية: 
+        <span style="color: {% if user_data.pid %} #69f0ae {% else %} #ff5370 {% endif %};">
+            {% if user_data.pid %} تعمل (PID: {{ user_data.pid }}) {% else %} متوقفة ⏹️ {% endif %}
+        </span>
+    </div>
+</div>
+
 <div class="grid">
-    
-    <!-- القسم الأول: التحكم في السيرفر وملف التشغيل والتيرمنال -->
     <div>
         <div class="card" style="margin-bottom: 25px;">
-            <h3>⚙️ التحكم في الاستضافة (Python Application)</h3>
-            <p>ملف التشغيل الرئيسي الحالي: <b style="color: #ff9f43;">{{ user.main_file }}</b></p>
-            
-            <form method="POST" action="/update_main_file" style="display: flex; gap: 10px;">
-                <input type="text" name="main_file" value="{{ user.main_file }}" placeholder="مثال: app.py أو bot.py" style="margin: 0;" required>
-                <button type="submit" class="btn btn-blue">تحديث ملف التشغيل</button>
+            <h3>⚙️ لوحة إدارة الملف والتنفيذ</h3>
+            <p>ملف التشغيل الحالي الافتراضي للـ Script: <b style="color:#ffb62c;">{{ user_data.main_file }}</b></p>
+            <form method="POST" action="/change_main" style="display:flex; gap:10px;">
+                <input type="text" name="main_file" value="{{ user_data.main_file }}" style="margin:0;" required>
+                <button type="submit" class="btn btn-blue">تعديل ملف التشغيل</button>
             </form>
-            
-            <div style="margin-top: 20px; display: flex; gap: 15px;">
-                <a href="/run_app" class="btn btn-green">▶️ تشغيل التطبيق في الخلفية</a>
-                <a href="/stop_app" class="btn btn-red">⏹️ إيقاف التطبيق</a>
+            <div style="margin-top: 20px; display: flex; gap: 10px;">
+                <a href="/start_script" class="btn btn-green">▶️ تشغيل السكريبت لايف</a>
+                <a href="/stop_script" class="btn btn-red">⏹️ إجبار الإيقاف الحالي</a>
             </div>
         </div>
 
         <div class="card">
-            <h3>💻 منفذ الأوامر التفاعلي (Terminal)</h3>
-            <div class="terminal">{% if terminal_output %}{{ terminal_output }}{% else %}$ هنا تظهر مخرجات الأوامر وسجلات التشغيل (Logs)...{% endif %}</div>
-            <form method="POST" action="/exec_command" style="display: flex; margin-top: 15px; gap: 10px;">
-                <input type="text" name="command" placeholder="اكتب الأمر هنا (مثال: pip install requests أو ls)" style="margin: 0;" required>
-                <button type="submit" class="btn btn-blue">تنفيذ</button>
+            <h3>💻 التيرمنال البث الحي (Live Stream Box)</h3>
+            <div class="terminal" id="live_terminal">$ نظام البث الفوري جاهز ومستعد لتلقي البيانات المتدفقة...&#10;</div>
+            <form method="POST" action="/run_custom_cmd" style="display:flex; margin-top: 15px; gap: 10px;">
+                <input type="text" name="cmd" placeholder="اكتب أمر سريع (مثال: pip install requests أو python -V)" style="margin:0;" required>
+                <button type="submit" class="btn btn-blue">تنفيذ الأوامر</button>
             </form>
         </div>
     </div>
 
-    <!-- القسم الثاني: مدير الملفات المتطور (File Manager) -->
     <div class="card">
-        <h3>📁 مدير ملفات الاستضافة المعزول (File Manager)</h3>
-        
-        <!-- أدوات الإنشاء والرفع -->
-        <div style="background: #25293c; padding: 15px; border-radius: 5px; margin-bottom: 15px;">
-            <form method="POST" action="/create_item" style="display: flex; gap: 10px; margin-bottom: 10px;">
-                <input type="text" name="name" placeholder="اسم الملف أو المجلد الجديد (مثال: config.json أو src)" style="margin: 0;" required>
-                <select name="type" style="margin:0; width: 120px;">
-                    <option value="file">ملف</option>
-                    <option value="folder">مجلد</option>
+        <h3>📁 مدير ملفات العميل المتقدم (File Manager)</h3>
+        <div style="background:#232635; padding:15px; border-radius:6px; margin-bottom:15px;">
+            <form method="POST" action="/make_item" style="display:flex; gap:10px; margin-bottom:10px;">
+                <input type="text" name="item_name" placeholder="اسم الملف أو المجلد الجديد" style="margin:0;" required>
+                <select name="item_type" style="margin:0; width:100px;">
+                    <option value="file">📄 ملف</option>
+                    <option value="folder">📁 مجلد</option>
                 </select>
-                <button type="submit" class="btn btn-green">إنشاء</button>
+                <button type="submit" class="btn btn-green">إضافة</button>
             </form>
-            
-            <form method="POST" action="/upload_file" enctype="multipart/form-data" style="display: flex; justify-content: space-between; align-items: center; margin-top: 15px;">
-                <input type="file" name="file" required>
-                <button type="submit" class="btn btn-blue">⬆️ رفع الملف</button>
+            <form method="POST" action="/upload_to_storage" enctype="multipart/form-data" style="display:flex; justify-content:space-between; align-items:center; margin-top:15px;">
+                <input type="file" name="file_upload" required>
+                <button type="submit" class="btn btn-blue">⬆️ رفع للمساحة</button>
             </form>
         </div>
 
-        <!-- جدول استعراض الملفات -->
-        <h4>الملفات البرمجية المتوفرة:</h4>
+        <h4>الملفات البرمجية المستضافة:</h4>
         <table>
             <thead>
                 <tr>
-                    <th>اسم الملف / المجلد</th>
-                    <th>الحجم / النوع</th>
-                    <th>العمليات</th>
+                    <th>الاسم</th>
+                    <th>النوع</th>
+                    <th>الإجراء</th>
                 </tr>
             </thead>
             <tbody>
-                {% for item in files_list %}
+                {% for file in file_list %}
                 <tr>
-                    <td>{% if item.is_dir %}📁 {% else %}📄 {% endif %}{{ item.name }}</td>
-                    <td>{{ item.size }}</td>
-                    <td>
-                        <a href="/delete_item?name={{ item.name }}" style="color: #ff5252; text-decoration: none; font-weight: bold;">حذف 🗑️</a>
-                    </td>
+                    <td>{{ file.name }}</td>
+                    <td>{{ '📁 مجلد' if file.is_dir else '📄 ملف نصي' }}</td>
+                    <td><a href="/remove_item?name={{ file.name }}" style="color:#ff5370; font-weight:bold; text-decoration:none;">حذف 🗑️</a></td>
                 </tr>
                 {% endfor %}
             </tbody>
@@ -196,86 +222,34 @@ DASHBOARD_HTML = """
 """
 
 ADMIN_HTML = """
-{% extends "base_layout" %}
+{% extends "layout" %}
 {% block content %}
 <div class="card">
-    <h3>👑 لوحة تحكم الإدارة العليا (الأدمن)</h3>
-    <a href="/dashboard" class="btn btn-blue">⬅️ العودة للوحة التحكم العادية</a>
+    <h3>👑 إدارة النظام العام (الأدمن)</h3>
+    <a href="/dashboard" class="btn btn-blue">العودة للوحة التحكم</a>
     <br><br>
-    <table>
-        <thead>
-            <tr>
-                <th>رقم العميل</th>
-                <th>اسم المستخدم</th>
-                <th>ملف التشغيل</th>
-                <th>معرف حاوية Docker للمستخدم</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for u in users %}
-            <tr>
-                <td>{{ u.id }}</td>
-                <td>{{ u.username }} {% if u.is_admin %}<b style="color: #00adb5;">(أدمن)</b>{% endif %}</td>
-                <td><code>{{ u.main_file }}</code></td>
-                <td><code style="color: #ff9f43;">{{ u.container_id or 'لا توجد حاوية نشطة' }}</code></td>
-            </tr>
-            {% endfor %}
-        </tbody>
+    <table border="1" style="width:100%; border-color:#232635;">
+        <tr>
+            <th>المستخدم</th>
+            <th>ملف التشغيل الرئيسي</th>
+            <th>رقم العملية النشطة في الخلفية (PID)</th>
+        </tr>
+        {% for name, data in users.items() %}
+        <tr>
+            <td>{{ name }}</td>
+            <td><code>{{ data.main_file }}</code></td>
+            <td><span style="color:#69f0ae;">{{ data.pid or 'لا توجد عملية جارية' }}</span></td>
+        </tr>
+        {% endfor %}
     </table>
 </div>
 {% endblock %}
 """
 
-# ----------------- مساعدات النظام (Docker Control & Helpers) -----------------
+# ----------------- مسارات ومنطق استضافة الويب (Routes) -----------------
 
-def get_user_container(user):
-    """جلب حاوية العميل أو إنشاؤها إن لم تكن موجودة"""
-    if not user.container_id:
-        container = client.containers.run(
-            "python:3.10-slim",
-            detach=True,
-            tty=True,
-            name=f"user_space_container_{user.id}",
-            mem_limit="256m",  # تحديد الرام
-            nano_cpus=500000000,  # نصف معالج لحماية خادمك
-            working_dir="/app"
-        )
-        user.container_id = container.id
-        db.commit()
-        # إنشاء بيئة العمل الافتراضية داخل الحاوية
-        container.exec_run("mkdir -p /app")
-        container.exec_run("touch /app/main.py")
-    else:
-        try:
-            container = client.containers.get(user.container_id)
-            if container.status != "running":
-                container.start()
-        except Exception:
-            user.container_id = None
-            db.commit()
-            return get_user_container(user)
-    return container
-
-def list_container_files(container):
-    """الحصول على قائمة الملفات والمجلدات داخل حاوية المستخدم الحالية"""
-    res = container.exec_run("ls -la /app")
-    output = res.output.decode('utf-8')
-    lines = output.split('\n')[3:] # تخطي الأسطر العلوية لـ ls
-    items = []
-    for line in lines:
-        parts = line.split()
-        if len(parts) >= 9:
-            name = parts[-1]
-            if name in ['.', '..']: continue
-            is_dir = line.startswith('d')
-            size = parts[4] + " Bytes" if not is_dir else "مجلد"
-            items.append({'name': name, 'is_dir': is_dir, 'size': size})
-    return items
-
-# ----------------- مسارات وخدمات الويب (Routes) -----------------
-
-@app.route('/base_layout')
-def base_layout(): return BASE_LAYOUT
+@app.route('/layout')
+def render_layout(): return LAYOUT
 
 @app.route('/')
 def index(): return redirect(url_for('login'))
@@ -283,147 +257,160 @@ def index(): return redirect(url_for('login'))
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        if User.query.filter_by(username=username).first():
-            flash('اسم المستخدم مسجل مسبقاً!')
+        user = request.form['username'].strip()
+        pwd = request.form['password']
+        if user in USERS:
+            flash('المستخدم محجوز بالسيرفر مسبقاً!')
             return redirect(url_for('register'))
-        new_user = User(username=username, password=password)
-        db.add(new_user)
-        db.commit()
-        flash('تم إنشاء استضافتك بنجاح، سجل دخولك الآن!')
+        USERS[user] = {'password': pwd, 'is_admin': False, 'main_file': 'main.py', 'pid': None}
+        os.makedirs(os.path.join(BASE_USER_DIR, user), exist_ok=True)
+        with open(os.path.join(BASE_USER_DIR, user, 'main.py'), 'w') as f:
+            f.write("print('Welcome to VibeHost! Script is running completely live.')")
+        flash('تم تخصيص السيرفر والمساحة بنجاح! سجل دخولك الآن.')
         return redirect(url_for('login'))
     return render_template_string(REGISTER_HTML)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        user = User.query.filter_by(username=username, password=password).first()
-        if user:
-            session['user_id'] = user.id
-            session['username'] = user.username
-            session['is_admin'] = user.is_admin
+        user = request.form['username'].strip()
+        pwd = request.form['password']
+        if user in USERS and USERS[user]['password'] == pwd:
+            session['username'] = user
+            session['is_admin'] = USERS[user]['is_admin']
             return redirect(url_for('dashboard'))
-        flash('خطأ في البيانات الدخول!')
+        flash('خطأ في اسم المستخدم أو الباسورد!')
     return render_template_string(LOGIN_HTML)
 
 @app.route('/dashboard')
 def dashboard():
-    if 'user_id' not in session: return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    container = get_user_container(user)
-    files = list_container_files(container)
-    terminal_output = session.pop('terminal_output', '')
-    return render_template_string(DASHBOARD_HTML, user=user, files_list=files, terminal_output=terminal_output)
-
-# 1. تحديث اسم ملف التشغيل الرئيسي
-@app.route('/update_main_file', methods=['POST'])
-def update_main_file():
-    if 'user_id' not in session: return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    new_name = request.form['main_file'].strip()
-    if new_name:
-        user.main_file = new_name
-        db.commit()
-        flash(f'تم تعديل اسم ملف التشغيل الرئيسي إلى {new_name}')
-    return redirect(url_for('dashboard'))
-
-# 2. تنفيذ أمر تيرمنال مباشر
-@app.route('/exec_command', methods=['POST'])
-def exec_command():
-    if 'user_id' not in session: return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    container = get_user_container(user)
-    command = request.form['command']
+    if 'username' not in session: return redirect(url_for('login'))
+    user = session['username']
+    user_path = os.path.join(BASE_USER_DIR, user)
+    os.makedirs(user_path, exist_ok=True)
     
-    # تنفيذ الأمر المعزول
-    res = container.exec_run(f"sh -c '{command}'", workdir="/app")
-    session['terminal_output'] = f"$ {command}\n" + res.output.decode('utf-8')
-    return redirect(url_for('dashboard'))
-
-# 3. إنشاء ملف أو مجلد جديد في الاستضافة
-@app.route('/create_item', methods=['POST'])
-def create_item():
-    if 'user_id' not in session: return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    container = get_user_container(user)
-    name = request.form['name'].strip()
-    item_type = request.form['type']
-    
-    if name:
-        if item_type == 'file':
-            container.exec_run(f"touch /app/{name}")
-        else:
-            container.exec_run(f"mkdir -p /app/{name}")
-        flash('تم الإنشاء بنجاح!')
-    return redirect(url_for('dashboard'))
-
-# 4. رفع ملف من الحاسوب إلى الحاوية المعزولة لـ Docker
-@app.route('/upload_file', methods=['POST'])
-def upload_file():
-    if 'user_id' not in session: return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    container = get_user_container(user)
-    file = request.files['file']
-    
-    if file:
-        filename = file.filename
-        file_data = file.read()
+    # جلب قائمة الملفات من المجلد المعزول للعميل الحالي
+    raw_files = os.listdir(user_path)
+    file_list = []
+    for f in raw_files:
+        file_list.append({'name': f, 'is_dir': os.path.isdir(os.path.join(user_path, f))})
         
-        # تحويل الملف المرفوع إلى ملف tar لكي يفهمه Docker API ويضعه بالمسار المعزول
-        tar_stream = io.BytesIO()
-        with tarfile.open(fileobj=tar_stream, mode='w') as tar:
-            tarinfo = tarfile.TarInfo(name=filename)
-            tarinfo.size = len(file_data)
-            tar.addfile(tarinfo, io.BytesIO(file_data))
-        
-        tar_stream.seek(0)
-        container.put_archive("/app", tar_stream)
-        flash('تم رفع الملف بنجاح إلى سيرفرك الشخصي!')
-        
+    return render_template_string(DASHBOARD_HTML, user_data=USERS[user], file_list=file_list)
+
+@app.route('/change_main', methods=['POST'])
+def change_main():
+    if 'username' not in session: return redirect(url_for('login'))
+    user = session['username']
+    USERS[user]['main_file'] = request.form['main_file'].strip()
+    flash('تم تبديل ملف تشغيل البوت/السكريبت الرئيسي.')
     return redirect(url_for('dashboard'))
 
-# 5. حذف ملف أو مجلد
-@app.route('/delete_item')
-def delete_item():
-    if 'user_id' not in session: return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    container = get_user_container(user)
-    name = request.args.get('name')
-    if name:
-        container.exec_run(f"rm -rf /app/{name}")
-        flash(f'تم حذف {name} نهائياً!')
+@app.route('/make_item', methods=['POST'])
+def make_item():
+    if 'username' not in session: return redirect(url_for('login'))
+    user = session['username']
+    name = secure_filename(request.form['item_name'])
+    itype = request.form['item_type']
+    target = os.path.join(BASE_USER_DIR, user, name)
+    if itype == 'file':
+        with open(target, 'w') as f: f.write("")
+    else:
+        os.makedirs(target, exist_ok=True)
     return redirect(url_for('dashboard'))
 
-# 6. تشغيل الكود البرمجي في الخلفية وعرض السجلات
-@app.route('/run_app')
-def run_app():
-    if 'user_id' not in session: return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    container = get_user_container(user)
+@app.route('/upload_to_storage', methods=['POST'])
+def upload_to_storage():
+    if 'username' not in session: return redirect(url_for('login'))
+    user = session['username']
+    f = request.files['file_upload']
+    if f:
+        filename = secure_filename(f.filename)
+        f.save(os.path.join(BASE_USER_DIR, user, filename))
+        flash('تم رفع الملف بنجاح لمساحتك الاستضافية!')
+    return redirect(url_for('dashboard'))
+
+@app.route('/remove_item')
+def remove_item():
+    if 'username' not in session: return redirect(url_for('login'))
+    user = session['username']
+    name = secure_filename(request.args.get('name'))
+    target = os.path.join(BASE_USER_DIR, user, name)
+    if os.path.exists(target):
+        if os.path.isdir(target): os.rmdir(target)
+        else: os.remove(target)
+    return redirect(url_for('dashboard'))
+
+# ----------------- تشغيل و بث التيرمنال لايف (SocketIO Background Tasks) -----------------
+
+def stream_process_output(user, process):
+    """قراءة مخرجات السكريبت وبثها فورياً للمتصفح عبر الـ WebSockets بدون تأخير"""
+    while True:
+        output = process.stdout.readline()
+        if output == '' and process.poll() is not None:
+            break
+        if output:
+            socketio.emit('terminal_stream', {'text': output})
+    process.wait()
+    USERS[user]['pid'] = None
+    socketio.emit('terminal_stream', {'text': '\n[🔴 تمت العملية أو تم إيقاف السكريبت بنجاح]\n'})
+
+@app.route('/start_script')
+def start_script():
+    if 'username' not in session: return redirect(url_for('login'))
+    user = session['username']
+    if USERS[user]['pid'] is not None:
+        flash('السكريبت يعمل بالفعل بالخلفية حالياً!')
+        return redirect(url_for('dashboard'))
+        
+    user_path = os.path.join(BASE_USER_DIR, user)
+    main_f = USERS[user]['main_file']
     
-    # تشغيل ملف البايثون المختار من المستخدم بالخلفية
-    res = container.exec_run(f"python3 {user.main_file}", workdir="/app", detach=False)
-    session['terminal_output'] = f"[تشغيل السيرفر لملف {user.main_file}...]\n" + res.output.decode('utf-8')
+    # تشغيل سكريبت بايثون كعملية فرعية مستقلة (Subprocess) في السيرفر وتوجيه المخرجات للـ WebSockets
+    proc = subprocess.Popen(
+        [sys.executable, main_f],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=user_path,
+        bufsize=1
+    )
+    USERS[user]['pid'] = proc.pid
+    
+    # تشغيل خيط منفصل لتمرير المخرجات للمتصفح لايف لاين-باي-لاين
+    Thread(target=stream_process_output, args=(user, proc), daemon=True).start()
     return redirect(url_for('dashboard'))
 
-# 7. إيقاف تشغيل الملف/الحاوية
-@app.route('/stop_app')
-def stop_app():
-    if 'user_id' not in session: return redirect(url_for('login'))
-    user = User.query.get(session['user_id'])
-    container = get_user_container(user)
-    container.restart() # إعادة تشغيل الحاوية لتطهير وإيقاف كل العمليات التي تعمل بالخلفية
-    session['terminal_output'] = "[تم إيقاف التطبيق وتصفير العمليات الجارية بنجاح]"
+@app.route('/stop_script')
+def stop_script():
+    if 'username' not in session: return redirect(url_for('login'))
+    user = session['username']
+    pid = USERS[user]['pid']
+    if pid:
+        try:
+            p = psutil.Process(pid)
+            p.terminate()  # إغلاق العملية وقتلها فورياً عن طريق psutil
+            flash('تم إنهاء السكريبت بنجاح!')
+        except Exception:
+            flash('العملية منتهية بالفعل.')
+        USERS[user]['pid'] = None
+    return redirect(url_for('dashboard'))
+
+@app.route('/run_custom_cmd', methods=['POST'])
+def run_custom_cmd():
+    if 'username' not in session: return redirect(url_for('login'))
+    user = session['username']
+    cmd = request.form['cmd']
+    user_path = os.path.join(BASE_USER_DIR, user)
+    
+    # تنفيذ أمر تيرمنال سريع وبث النتيجة فورا
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=user_path)
+    socketio.emit('terminal_stream', {'text': f"\n$ {cmd}\n{res.stdout}{res.stderr}\n"})
     return redirect(url_for('dashboard'))
 
 @app.route('/admin')
 def admin():
-    if 'user_id' not in session or not session.get('is_admin'): return "غير مصرح لك", 403
-    all_users = User.query.all()
-    return render_template_string(ADMIN_HTML, users=all_users)
+    if 'username' not in session or not session.get('is_admin'): return "ممنوع", 403
+    return render_template_string(ADMIN_HTML, users=USERS)
 
 @app.route('/logout')
 def logout():
@@ -431,4 +418,5 @@ def logout():
     return redirect(url_for('login'))
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # لتشغيل التطبيق عبر محرك الـ SocketIO المطور والمتوافق تماماً مع جيفينت وإيفينتليت وسيرفر gunicorn على ريلاي وايه
+    socketio.run(app, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
